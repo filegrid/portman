@@ -1,0 +1,17 @@
+/node_modules/
+/dist/
+/src-tauri/target/
+/src-tauri/gen/
+/.cargo/
+/.npm-cache/
+/.pnpm-store/
+/coverage/
+/.vscode/
+/.idea/
+.env
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.log
