@@ -15,6 +15,7 @@ Portman is a Windows desktop port manager for inspecting and tracking Windows an
 - Create, enable, disable, and delete PortProxy mappings managed by Portman.
 - Use `v4tov4` and `127.0.0.1` by default, with other proxy types and addresses available under advanced options.
 - Open a Windows process executable directory from its context menu.
+- Switch between English and Simplified Chinese; English is the default.
 - Store configuration in `%USERPROFILE%\.portman\config.yaml`.
 
 ## Running the Application

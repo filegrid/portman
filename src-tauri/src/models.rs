@@ -7,6 +7,8 @@ pub struct ConfigFile {
     pub settings: Settings,
     #[serde(default)]
     pub services: Vec<TrackedService>,
+    #[serde(default)]
+    pub port_mappings: Vec<PortMappingConfig>,
 }
 
 impl Default for ConfigFile {
@@ -15,6 +17,7 @@ impl Default for ConfigFile {
             version: 1,
             settings: Settings::default(),
             services: Vec::new(),
+            port_mappings: Vec::new(),
         }
     }
 }
@@ -85,6 +88,17 @@ pub struct ForwardingConfig {
     pub connect_address: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_applied_connect_address: Option<String>,
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PortMappingConfig {
+    pub proxy_type: PortProxyType,
+    pub listen_address: String,
+    pub external_port: u16,
+    pub connect_address: String,
+    pub target_port: u16,
     #[serde(default)]
     pub enabled: bool,
 }
@@ -177,6 +191,7 @@ pub struct DiscoveryResult {
 pub struct DashboardSnapshot {
     pub generated_at: String,
     pub services: Vec<ServiceView>,
+    pub port_mappings: Vec<ActualForwardingView>,
     pub system: SystemView,
     pub warnings: Vec<AppWarning>,
     pub config_path: String,
@@ -251,6 +266,8 @@ pub struct ActualForwardingView {
     pub external_port: u16,
     pub connect_address: String,
     pub target_port: u16,
+    pub enabled: bool,
+    pub source_available: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -342,5 +359,29 @@ pub struct CreateForwardingRequest {
 #[serde(rename_all = "camelCase")]
 pub struct SetForwardingEnabledRequest {
     pub service_id: String,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PortMappingRequest {
+    pub proxy_type: PortProxyType,
+    pub listen_address: String,
+    pub external_port: u16,
+    pub connect_address: String,
+    pub target_port: u16,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreatePortMappingsRequest {
+    pub mappings: Vec<PortMappingRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetPortMappingEnabledRequest {
+    #[serde(flatten)]
+    pub mapping: PortMappingRequest,
     pub enabled: bool,
 }

@@ -173,6 +173,28 @@ fn validate_config(config: &ConfigFile) -> Result<(), ApiError> {
             }
         }
     }
+    let mut mapping_listeners = std::collections::HashSet::new();
+    for mapping in &config.port_mappings {
+        if mapping.external_port == 0 || mapping.target_port == 0 {
+            return Err(ApiError::new(
+                "CONFIG_INVALID",
+                "独立映射端口必须在 1–65535 之间",
+            ));
+        }
+        validate_forwarding_address(
+            mapping.proxy_type,
+            &mapping.listen_address,
+            Some(&mapping.connect_address),
+        )?;
+        let key = format!(
+            "{}:{}",
+            mapping.listen_address.to_lowercase(),
+            mapping.external_port
+        );
+        if !mapping_listeners.insert(key) {
+            return Err(ApiError::new("CONFIG_INVALID", "映射监听端点重复"));
+        }
+    }
     Ok(())
 }
 

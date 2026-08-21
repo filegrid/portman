@@ -5,6 +5,9 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 use uuid::Uuid;
+use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
+use windows_sys::Win32::System::Threading::{WaitForSingleObject, INFINITE};
+use windows_sys::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
 use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE};
 use winreg::RegKey;
 
@@ -22,6 +25,7 @@ pub struct PortProxyRule {
 #[serde(rename_all = "snake_case")]
 enum HelperAction {
     AddRule,
+    AddRules,
     DeleteRule,
     StartIpHelper,
 }
@@ -30,6 +34,8 @@ enum HelperAction {
 struct HelperRequest {
     action: HelperAction,
     rule: Option<PortProxyRule>,
+    #[serde(default)]
+    rules: Vec<PortProxyRule>,
     response_path: PathBuf,
 }
 
@@ -112,18 +118,26 @@ pub fn ip_helper_state() -> String {
 }
 
 pub fn add_rule(rule: PortProxyRule) -> Result<(), ApiError> {
-    run_elevated(HelperAction::AddRule, Some(rule))
+    run_elevated(HelperAction::AddRule, Some(rule), Vec::new())
+}
+
+pub fn add_rules(rules: Vec<PortProxyRule>) -> Result<(), ApiError> {
+    run_elevated(HelperAction::AddRules, None, rules)
 }
 
 pub fn delete_rule(rule: PortProxyRule) -> Result<(), ApiError> {
-    run_elevated(HelperAction::DeleteRule, Some(rule))
+    run_elevated(HelperAction::DeleteRule, Some(rule), Vec::new())
 }
 
 pub fn start_ip_helper() -> Result<(), ApiError> {
-    run_elevated(HelperAction::StartIpHelper, None)
+    run_elevated(HelperAction::StartIpHelper, None, Vec::new())
 }
 
-fn run_elevated(action: HelperAction, rule: Option<PortProxyRule>) -> Result<(), ApiError> {
+fn run_elevated(
+    action: HelperAction,
+    rule: Option<PortProxyRule>,
+    rules: Vec<PortProxyRule>,
+) -> Result<(), ApiError> {
     let temp_dir = std::env::temp_dir();
     let token = Uuid::new_v4();
     let request_path = temp_dir.join(format!("portman-{token}.request.json"));
@@ -131,6 +145,7 @@ fn run_elevated(action: HelperAction, rule: Option<PortProxyRule>) -> Result<(),
     let request = HelperRequest {
         action,
         rule,
+        rules,
         response_path: response_path.clone(),
     };
     let bytes = serde_json::to_vec(&request)
@@ -140,40 +155,47 @@ fn run_elevated(action: HelperAction, rule: Option<PortProxyRule>) -> Result<(),
 
     let executable = std::env::current_exe()
         .map_err(|e| ApiError::new("ELEVATION_FAILED", format!("定位应用程序失败：{e}")))?;
-    let script = r#"param([string]$ExePath,[string]$RequestPath)
-try {
-  $quotedRequest = '"' + $RequestPath.Replace('"','\"') + '"'
-  $process = Start-Process -FilePath $ExePath -ArgumentList @('--portman-helper', $quotedRequest) -Verb RunAs -Wait -PassThru -WindowStyle Hidden
-  exit $process.ExitCode
-} catch {
-  [Console]::Error.WriteLine($_.Exception.Message)
-  exit 1223
-}"#;
-    let output = hidden_command("powershell.exe")
-        .args([
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            script,
-            "-ExePath",
-            &executable.to_string_lossy(),
-            "-RequestPath",
-            &request_path.to_string_lossy(),
-        ])
-        .stdin(Stdio::null())
-        .output();
-
-    let _ = fs::remove_file(&request_path);
-    let output =
-        output.map_err(|e| ApiError::new("ELEVATION_FAILED", format!("启动提权助手失败：{e}")))?;
-    if !output.status.success() && !response_path.exists() {
+    let verb = wide_string("runas");
+    let executable_wide = wide_string(&executable.to_string_lossy());
+    let parameters = wide_string(&format!(
+        "--portman-helper \"{}\"",
+        request_path.to_string_lossy().replace('"', "\\\"")
+    ));
+    let mut shell_info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
+    shell_info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+    shell_info.fMask = SEE_MASK_NOCLOSEPROCESS;
+    shell_info.lpVerb = verb.as_ptr();
+    shell_info.lpFile = executable_wide.as_ptr();
+    shell_info.lpParameters = parameters.as_ptr();
+    shell_info.nShow = 0;
+    let launched = unsafe { ShellExecuteExW(&mut shell_info) };
+    if launched == 0 {
+        let error = unsafe { GetLastError() };
+        let _ = fs::remove_file(&request_path);
         return Err(ApiError::new(
-            "ELEVATION_CANCELLED",
-            format!(
-                "管理员授权被取消或提权失败：{}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ),
+            if error == 1223 {
+                "ELEVATION_CANCELLED"
+            } else {
+                "ELEVATION_FAILED"
+            },
+            if error == 1223 {
+                "管理员授权已取消".into()
+            } else {
+                format!("启动管理员助手失败（Windows 错误 {error}）")
+            },
+        ));
+    }
+    if !shell_info.hProcess.is_null() {
+        unsafe {
+            WaitForSingleObject(shell_info.hProcess, INFINITE);
+            CloseHandle(shell_info.hProcess);
+        }
+    }
+    let _ = fs::remove_file(&request_path);
+    if !response_path.exists() {
+        return Err(ApiError::new(
+            "ELEVATION_FAILED",
+            "管理员助手未返回执行结果",
         ));
     }
 
@@ -187,6 +209,10 @@ try {
     } else {
         Err(ApiError::new("PORTPROXY_APPLY_FAILED", response.message))
     }
+}
+
+fn wide_string(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 pub fn run_elevated_helper_if_requested() -> bool {
@@ -229,6 +255,27 @@ fn execute_helper(request: &HelperRequest) -> Result<String, String> {
             write_rule(rule)?;
             notify_ip_helper()?;
             Ok("端口转发已启用".into())
+        }
+        HelperAction::AddRules => {
+            if request.rules.is_empty() {
+                return Err("提权请求缺少批量规则".into());
+            }
+            for rule in &request.rules {
+                validate_rule(rule)?;
+            }
+            ensure_ip_helper_running()?;
+            let mut written = Vec::new();
+            for rule in &request.rules {
+                if let Err(error) = write_rule(rule) {
+                    for added in written.iter().rev() {
+                        let _ = delete_rule_direct(added);
+                    }
+                    return Err(error);
+                }
+                written.push(rule.clone());
+            }
+            notify_ip_helper()?;
+            Ok(format!("已添加 {} 条端口映射", request.rules.len()))
         }
         HelperAction::DeleteRule => {
             let rule = request.rule.as_ref().ok_or("提权请求缺少规则")?;

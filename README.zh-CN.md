@@ -15,6 +15,7 @@ Portman 是一个面向 Windows 的桌面端口管理工具，用于查看和关
 - 新增、启用、禁用和删除由 Portman 管理的 PortProxy 转发；
 - 默认使用 `v4tov4` 和 `127.0.0.1`，其他代理类型与地址位于高级选项；
 - 右键菜单可打开 Windows 进程可执行文件所在目录；
+- 支持英文与简体中文切换，默认使用英文；
 - 配置保存到 `%USERPROFILE%\.portman\config.yaml`。
 
 ## 运行

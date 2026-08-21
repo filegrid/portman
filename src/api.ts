@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core'
-import type { DashboardSnapshot, DiscoveryResult, ProxyType } from './types'
+import type { DashboardSnapshot, DiscoveryResult, PortMapping, ProxyType } from './types'
 
 export const api = {
   snapshot: () => invoke<DashboardSnapshot>('get_dashboard_snapshot'),
@@ -26,5 +26,13 @@ export const api = {
     invoke<{ message: string }>('set_forwarding_enabled', { request: { serviceId, enabled } }),
   deleteForwarding: (serviceId: string) =>
     invoke<{ message: string }>('delete_forwarding', { request: { serviceId } }),
+  createPortMapping: (request: PortMapping) =>
+    invoke<{ message: string }>('create_port_mapping', { request }),
+  createPortMappings: (mappings: PortMapping[]) =>
+    invoke<{ message: string }>('create_port_mappings', { request: { mappings } }),
+  deletePortMapping: (request: PortMapping) =>
+    invoke<{ message: string }>('delete_port_mapping', { request }),
+  setPortMappingEnabled: (mapping: PortMapping, enabled: boolean) =>
+    invoke<{ message: string }>('set_port_mapping_enabled', { request: { ...mapping, enabled } }),
   startIpHelper: () => invoke<{ message: string }>('start_ip_helper_service'),
 }

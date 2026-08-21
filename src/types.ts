@@ -9,6 +9,16 @@ export interface Endpoint {
   port: number
 }
 
+export interface PortMapping {
+  proxyType: ProxyType
+  listenAddress: string
+  externalPort: number
+  connectAddress: string
+  targetPort: number
+  enabled: boolean
+  sourceAvailable: boolean
+}
+
 export interface ServiceView {
   id: string
   name: string
@@ -29,13 +39,7 @@ export interface ServiceView {
     connectAddress?: string
     enabled: boolean
   }
-  actualForwardings: Array<{
-    proxyType: ProxyType
-    listenAddress: string
-    externalPort: number
-    connectAddress: string
-    targetPort: number
-  }>
+  actualForwardings: PortMapping[]
   diagnostics: Array<{ code: string; message: string }>
   capabilities: {
     canCreateForwarding: boolean
@@ -48,6 +52,7 @@ export interface ServiceView {
 export interface DashboardSnapshot {
   generatedAt: string
   services: ServiceView[]
+  portMappings: PortMapping[]
   system: { ipHelperState: 'running' | 'stopped' | 'unknown' }
   warnings: Array<{ code: string; message: string }>
   configPath: string

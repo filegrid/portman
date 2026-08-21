@@ -20,12 +20,15 @@ struct AppState {
 #[tauri::command]
 fn get_dashboard_snapshot() -> Result<DashboardSnapshot, ApiError> {
     let config = load_config()?;
-    let include_wsl = config
-        .services
-        .iter()
-        .any(|service| service.category == ServiceCategory::Wsl);
+    let rules_result = portproxy::read_rules();
+    let include_wsl = !config.port_mappings.is_empty()
+        || rules_result.as_ref().is_ok_and(|rules| !rules.is_empty())
+        || config
+            .services
+            .iter()
+            .any(|service| service.category == ServiceCategory::Wsl);
     let (detected, mut warnings) = discover_all(include_wsl);
-    let rules = match portproxy::read_rules() {
+    let rules = match rules_result {
         Ok(rules) => rules,
         Err(error) => {
             warnings.push(AppWarning {
@@ -59,6 +62,45 @@ fn get_dashboard_snapshot() -> Result<DashboardSnapshot, ApiError> {
             .min()
             .unwrap_or(u16::MAX)
     });
+    let mut port_mappings = rules
+        .iter()
+        .map(|rule| ActualForwardingView {
+            proxy_type: rule.proxy_type,
+            listen_address: rule.listen_address.clone(),
+            external_port: rule.listen_port,
+            connect_address: rule.connect_address.clone(),
+            target_port: rule.connect_port,
+            enabled: true,
+            source_available: mapping_source_available(rule, &detected, &rules),
+        })
+        .collect::<Vec<_>>();
+    for configured in &config.port_mappings {
+        let is_active = rules
+            .iter()
+            .any(|rule| port_mapping_config_matches_rule(configured, rule));
+        if !is_active {
+            port_mappings.push(ActualForwardingView {
+                proxy_type: configured.proxy_type,
+                listen_address: configured.listen_address.clone(),
+                external_port: configured.external_port,
+                connect_address: configured.connect_address.clone(),
+                target_port: configured.target_port,
+                enabled: false,
+                source_available: mapping_source_endpoint_available(
+                    &configured.connect_address,
+                    configured.target_port,
+                    &detected,
+                    &rules,
+                ),
+            });
+        }
+    }
+    port_mappings.sort_by(|left, right| {
+        left.external_port
+            .cmp(&right.external_port)
+            .then_with(|| left.listen_address.cmp(&right.listen_address))
+            .then_with(|| left.proxy_type.as_str().cmp(right.proxy_type.as_str()))
+    });
     let generated_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -67,6 +109,7 @@ fn get_dashboard_snapshot() -> Result<DashboardSnapshot, ApiError> {
     Ok(DashboardSnapshot {
         generated_at,
         services,
+        port_mappings,
         system: SystemView { ip_helper_state },
         warnings,
         config_path: config_path()?.display().to_string(),
@@ -441,6 +484,190 @@ fn set_forwarding_enabled(
 }
 
 #[tauri::command]
+fn create_port_mapping(
+    request: PortMappingRequest,
+    state: tauri::State<'_, AppState>,
+) -> Result<OperationResult, ApiError> {
+    let _operation = lock_operation(&state)?;
+    let rule = port_mapping_rule(&request)?;
+    let (detected, _) = discover_all(true);
+    let existing = portproxy::read_rules()?;
+    let source_available = mapping_source_available(&rule, &detected, &existing);
+    let source = format!("{}:{}", rule.connect_address, rule.connect_port);
+    ensure_system_listener_available(&rule)?;
+    portproxy::add_rule(rule)?;
+    Ok(OperationResult {
+        message: if source_available {
+            "端口映射已添加".into()
+        } else {
+            format!("端口映射已添加；服务源 {source} 当前没有 TCP 监听")
+        },
+    })
+}
+
+#[tauri::command]
+fn create_port_mappings(
+    request: CreatePortMappingsRequest,
+    state: tauri::State<'_, AppState>,
+) -> Result<OperationResult, ApiError> {
+    let _operation = lock_operation(&state)?;
+    let mut config = load_config()?;
+    if request.mappings.is_empty() || request.mappings.len() > 256 {
+        return Err(ApiError::new(
+            "INVALID_BATCH",
+            "每次必须添加 1–256 条端口映射",
+        ));
+    }
+    let existing = portproxy::read_rules()?;
+    let (detected, _) = discover_all(true);
+    let mut rules = Vec::with_capacity(request.mappings.len());
+    let mut unavailable_sources = Vec::new();
+    for mapping in &request.mappings {
+        let rule = port_mapping_rule(mapping)?;
+        if !mapping_source_available(&rule, &detected, &existing) {
+            unavailable_sources.push(format!("{}:{}", rule.connect_address, rule.connect_port));
+        }
+        if let Some(conflict) = existing.iter().chain(rules.iter()).find(|item| {
+            normalize_address(&item.listen_address) == normalize_address(&rule.listen_address)
+                && item.listen_port == rule.listen_port
+        }) {
+            return Err(ApiError::new(
+                "PORT_CONFLICT",
+                format!(
+                    "映射目标 {}:{} 已指向 {}:{}",
+                    conflict.listen_address,
+                    conflict.listen_port,
+                    conflict.connect_address,
+                    conflict.connect_port
+                ),
+            ));
+        }
+        rules.push(rule);
+    }
+    let count = rules.len();
+    let original_len = config.port_mappings.len();
+    config
+        .port_mappings
+        .extend(rules.iter().map(|rule| port_mapping_config(rule, false)));
+    save_config(&config)?;
+    if let Err(error) = portproxy::add_rules(rules.clone()) {
+        config.port_mappings.truncate(original_len);
+        let _ = save_config(&config);
+        return Err(error);
+    }
+    for configured in &mut config.port_mappings[original_len..] {
+        configured.enabled = true;
+    }
+    save_config(&config)?;
+    Ok(OperationResult {
+        message: if unavailable_sources.is_empty() {
+            format!("已添加 {count} 条端口映射")
+        } else {
+            format!(
+                "已添加 {count} 条端口映射；以下服务源当前没有 TCP 监听：{}",
+                unavailable_sources.join("、")
+            )
+        },
+    })
+}
+
+#[tauri::command]
+fn delete_port_mapping(
+    request: PortMappingRequest,
+    state: tauri::State<'_, AppState>,
+) -> Result<OperationResult, ApiError> {
+    let _operation = lock_operation(&state)?;
+    let mut config = load_config()?;
+    let requested = port_mapping_rule(&request)?;
+    let active_rule = portproxy::read_rules()?.into_iter().find(|rule| {
+        port_mapping_config_matches_rule(&port_mapping_config(rule, true), &requested)
+    });
+    let original_len = config.port_mappings.len();
+    config
+        .port_mappings
+        .retain(|configured| !port_mapping_config_matches_rule(configured, &requested));
+    if active_rule.is_none() && config.port_mappings.len() == original_len {
+        return Err(ApiError::new("MAPPING_NOT_FOUND", "该端口映射已不存在"));
+    }
+    if let Some(rule) = &active_rule {
+        portproxy::delete_rule(rule.clone())?;
+    }
+    if let Err(error) = save_config(&config) {
+        if let Some(rule) = active_rule {
+            let _ = portproxy::add_rule(rule);
+        }
+        return Err(error);
+    }
+    Ok(OperationResult {
+        message: "端口映射已删除".into(),
+    })
+}
+
+#[tauri::command]
+fn set_port_mapping_enabled(
+    request: SetPortMappingEnabledRequest,
+    state: tauri::State<'_, AppState>,
+) -> Result<OperationResult, ApiError> {
+    let _operation = lock_operation(&state)?;
+    let mut config = load_config()?;
+    let requested = port_mapping_rule(&request.mapping)?;
+    let configured_index = config
+        .port_mappings
+        .iter()
+        .position(|configured| port_mapping_config_matches_rule(configured, &requested));
+
+    if request.enabled {
+        let (detected, _) = discover_all(true);
+        let existing = portproxy::read_rules()?;
+        let source_available = mapping_source_available(&requested, &detected, &existing);
+        let source = format!("{}:{}", requested.connect_address, requested.connect_port);
+        ensure_system_listener_available(&requested)?;
+        portproxy::add_rule(requested.clone())?;
+        if let Some(index) = configured_index {
+            config.port_mappings[index].enabled = true;
+        } else {
+            config
+                .port_mappings
+                .push(port_mapping_config(&requested, true));
+        }
+        if let Err(error) = save_config(&config) {
+            let _ = portproxy::delete_rule(requested);
+            return Err(error);
+        }
+        Ok(OperationResult {
+            message: if source_available {
+                "端口映射已启用".into()
+            } else {
+                format!("端口映射已启用；服务源 {source} 当前没有 TCP 监听")
+            },
+        })
+    } else {
+        let active_rule = portproxy::read_rules()?.into_iter().find(|rule| {
+            port_mapping_config_matches_rule(&port_mapping_config(rule, true), &requested)
+        });
+        if let Some(rule) = &active_rule {
+            portproxy::delete_rule(rule.clone())?;
+        }
+        if let Some(index) = configured_index {
+            config.port_mappings[index].enabled = false;
+        } else {
+            config
+                .port_mappings
+                .push(port_mapping_config(&requested, false));
+        }
+        if let Err(error) = save_config(&config) {
+            if let Some(rule) = active_rule {
+                let _ = portproxy::add_rule(rule);
+            }
+            return Err(error);
+        }
+        Ok(OperationResult {
+            message: "端口映射已禁用".into(),
+        })
+    }
+}
+
+#[tauri::command]
 fn delete_forwarding(
     request: ServiceIdRequest,
     state: tauri::State<'_, AppState>,
@@ -567,6 +794,104 @@ fn ensure_system_listener_available(rule: &PortProxyRule) -> Result<(), ApiError
         ));
     }
     Ok(())
+}
+
+fn mapping_source_available(
+    rule: &PortProxyRule,
+    detected: &[DiscoveredEndpoint],
+    portproxy_rules: &[PortProxyRule],
+) -> bool {
+    mapping_source_endpoint_available(
+        &rule.connect_address,
+        rule.connect_port,
+        detected,
+        portproxy_rules,
+    )
+}
+
+fn mapping_source_endpoint_available(
+    connect_address: &str,
+    connect_port: u16,
+    detected: &[DiscoveredEndpoint],
+    portproxy_rules: &[PortProxyRule],
+) -> bool {
+    detected.iter().any(|candidate| {
+        candidate.protocol == Protocol::Tcp
+            && candidate.port == connect_port
+            && ((!is_portproxy_listener(&candidate.address, candidate.port, portproxy_rules)
+                && mapping_source_address_matches(connect_address, &candidate.address))
+                || is_wsl_relay_source(candidate, connect_address))
+    })
+}
+
+fn is_wsl_relay_source(candidate: &DiscoveredEndpoint, connect_address: &str) -> bool {
+    is_wsl_relay(candidate)
+        && normalize_address(connect_address)
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| match address {
+                std::net::IpAddr::V4(address) => address.is_private(),
+                std::net::IpAddr::V6(address) => address.is_unique_local(),
+            })
+}
+
+fn is_portproxy_listener(address: &str, port: u16, rules: &[PortProxyRule]) -> bool {
+    rules.iter().any(|rule| {
+        rule.listen_port == port
+            && normalize_address(&rule.listen_address) == normalize_address(address)
+    })
+}
+
+fn mapping_source_address_matches(requested: &str, listening: &str) -> bool {
+    if normalize_address(requested) == normalize_address(listening) {
+        return true;
+    }
+    let (Ok(requested), Ok(listening)) = (
+        normalize_address(requested).parse::<std::net::IpAddr>(),
+        normalize_address(listening).parse::<std::net::IpAddr>(),
+    ) else {
+        return false;
+    };
+    requested.is_ipv4() == listening.is_ipv4()
+        && (requested.is_unspecified() || listening.is_unspecified())
+}
+
+fn port_mapping_rule(request: &PortMappingRequest) -> Result<PortProxyRule, ApiError> {
+    if request.external_port == 0 || request.target_port == 0 {
+        return Err(ApiError::new(
+            "INVALID_PORT",
+            "监听端口和目标端口必须在 1–65535 之间",
+        ));
+    }
+    let listen_address = request.listen_address.trim();
+    let connect_address = request.connect_address.trim();
+    validate_forwarding_address(request.proxy_type, listen_address, Some(connect_address))?;
+    Ok(PortProxyRule {
+        proxy_type: request.proxy_type,
+        listen_address: normalize_address(listen_address),
+        listen_port: request.external_port,
+        connect_address: normalize_address(connect_address),
+        connect_port: request.target_port,
+    })
+}
+
+fn port_mapping_config(rule: &PortProxyRule, enabled: bool) -> PortMappingConfig {
+    PortMappingConfig {
+        proxy_type: rule.proxy_type,
+        listen_address: rule.listen_address.clone(),
+        external_port: rule.listen_port,
+        connect_address: rule.connect_address.clone(),
+        target_port: rule.connect_port,
+        enabled,
+    }
+}
+
+fn port_mapping_config_matches_rule(configured: &PortMappingConfig, rule: &PortProxyRule) -> bool {
+    configured.proxy_type == rule.proxy_type
+        && normalize_address(&configured.listen_address) == normalize_address(&rule.listen_address)
+        && configured.external_port == rule.listen_port
+        && normalize_address(&configured.connect_address)
+            == normalize_address(&rule.connect_address)
+        && configured.target_port == rule.connect_port
 }
 
 fn make_rule(
@@ -802,7 +1127,11 @@ fn build_service_view(
                 .any(|candidate| binding_matches_candidate(binding, candidate)),
         })
         .collect::<Vec<_>>();
-    let current = service_candidates.first().copied();
+    let current = service_candidates
+        .iter()
+        .find(|candidate| candidate.category == service.category)
+        .copied()
+        .or_else(|| service_candidates.first().copied());
     let actual_forwardings = actual_rules
         .iter()
         .map(|rule| ActualForwardingView {
@@ -811,6 +1140,8 @@ fn build_service_view(
             external_port: rule.listen_port,
             connect_address: rule.connect_address.clone(),
             target_port: rule.connect_port,
+            enabled: true,
+            source_available: mapping_source_available(rule, detected, rules),
         })
         .collect::<Vec<_>>();
     let directly_exposed = service_candidates.iter().any(|candidate| {
@@ -992,8 +1323,103 @@ pub fn run() {
             create_forwarding,
             set_forwarding_enabled,
             delete_forwarding,
+            create_port_mapping,
+            create_port_mappings,
+            delete_port_mapping,
+            set_port_mapping_enabled,
             start_ip_helper_service,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Portman");
+}
+
+#[cfg(test)]
+mod mapping_tests {
+    use super::{
+        is_portproxy_listener, mapping_source_address_matches, mapping_source_endpoint_available,
+        PortProxyRule,
+    };
+    use crate::models::{DiscoveredEndpoint, PortProxyType, Protocol, ServiceCategory};
+
+    #[test]
+    fn source_address_accepts_exact_and_wildcard_listeners() {
+        assert!(mapping_source_address_matches("127.0.0.1", "127.0.0.1"));
+        assert!(mapping_source_address_matches("127.0.0.1", "0.0.0.0"));
+        assert!(mapping_source_address_matches("0.0.0.0", "192.168.1.20"));
+        assert!(mapping_source_address_matches("::1", "::"));
+    }
+
+    #[test]
+    fn source_address_rejects_different_specific_addresses_and_families() {
+        assert!(!mapping_source_address_matches("127.0.0.1", "192.168.1.20"));
+        assert!(!mapping_source_address_matches("127.0.0.1", "::"));
+    }
+
+    #[test]
+    fn portproxy_listener_is_not_treated_as_a_service_source() {
+        let rules = vec![PortProxyRule {
+            proxy_type: PortProxyType::V4ToV4,
+            listen_address: "0.0.0.0".into(),
+            listen_port: 40_001,
+            connect_address: "127.0.0.1".into(),
+            connect_port: 40_001,
+        }];
+        assert!(is_portproxy_listener("0.0.0.0", 40_001, &rules));
+        assert!(!is_portproxy_listener("127.0.0.1", 40_001, &rules));
+        assert!(!is_portproxy_listener("0.0.0.0", 40_002, &rules));
+    }
+
+    #[test]
+    fn wslrelay_marks_private_wsl_mapping_source_available() {
+        let rule = PortProxyRule {
+            proxy_type: PortProxyType::V4ToV4,
+            listen_address: "0.0.0.0".into(),
+            listen_port: 36_500,
+            connect_address: "192.168.15.126".into(),
+            connect_port: 36_500,
+        };
+        let endpoints = vec![
+            discovered_endpoint("0.0.0.0", 36_500, "svchost.exe"),
+            discovered_endpoint("::1", 36_500, "wslrelay.exe"),
+        ];
+        assert!(mapping_source_endpoint_available(
+            &rule.connect_address,
+            rule.connect_port,
+            &endpoints,
+            std::slice::from_ref(&rule),
+        ));
+    }
+
+    #[test]
+    fn ip_helper_alone_does_not_mark_loopback_mapping_source_available() {
+        let rule = PortProxyRule {
+            proxy_type: PortProxyType::V4ToV4,
+            listen_address: "0.0.0.0".into(),
+            listen_port: 40_001,
+            connect_address: "127.0.0.1".into(),
+            connect_port: 40_001,
+        };
+        let endpoints = vec![discovered_endpoint("0.0.0.0", 40_001, "svchost.exe")];
+        assert!(!mapping_source_endpoint_available(
+            &rule.connect_address,
+            rule.connect_port,
+            &endpoints,
+            std::slice::from_ref(&rule),
+        ));
+    }
+
+    fn discovered_endpoint(address: &str, port: u16, process_name: &str) -> DiscoveredEndpoint {
+        DiscoveredEndpoint {
+            candidate_token: String::new(),
+            category: ServiceCategory::Windows,
+            category_detail: Some(process_name.into()),
+            protocol: Protocol::Tcp,
+            address: address.into(),
+            port,
+            pid: None,
+            process_name: Some(process_name.into()),
+            process_path: None,
+            port_proxy_relations: Vec::new(),
+        }
+    }
 }
