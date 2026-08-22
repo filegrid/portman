@@ -10,13 +10,18 @@ import {
   CircleOff,
   Cog,
   FolderOpen,
+  Monitor,
+  Moon,
   Network,
+  Palette,
   Plus,
   RefreshCw,
   Search,
   Server,
   ShieldAlert,
   SlidersHorizontal,
+  Sun,
+  Languages,
   Trash2,
   X,
 } from 'lucide-react'
@@ -24,9 +29,15 @@ import { api } from './api'
 import type { ApiError, Candidate, DashboardSnapshot, DiscoveryResult, PortMapping, ProxyType, ServiceView } from './types'
 
 type Language = 'en' | 'zh'
+type LanguagePreference = Language | 'system'
+type ThemePreference = 'light' | 'dark' | 'system'
 
 function l(language: Language, english: string, chinese: string) {
   return language === 'zh' ? chinese : english
+}
+
+function systemLanguage(): Language {
+  return navigator.language.toLowerCase().startsWith('zh') ? 'zh' : 'en'
 }
 
 const emptySnapshot: DashboardSnapshot = {
@@ -97,7 +108,19 @@ function operationMessage(message: string, language: Language) {
 }
 
 export default function App() {
-  const [language, setLanguage] = useState<Language>(() => localStorage.getItem('portman.language') === 'zh' ? 'zh' : 'en')
+  const [languagePreference, setLanguagePreference] = useState<LanguagePreference>(() => {
+    const saved = localStorage.getItem('portman.language')
+    return saved === 'en' || saved === 'zh' ? saved : 'system'
+  })
+  const [systemLanguageValue, setSystemLanguageValue] = useState<Language>(systemLanguage)
+  const [themePreference, setThemePreference] = useState<ThemePreference>(() => {
+    const saved = localStorage.getItem('portman.theme')
+    return saved === 'light' || saved === 'dark' ? saved : 'system'
+  })
+  const [systemTheme, setSystemTheme] = useState<'light' | 'dark'>(() =>
+    window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')
+  const language = languagePreference === 'system' ? systemLanguageValue : languagePreference
+  const theme = themePreference === 'system' ? systemTheme : themePreference
   const languageRef = useRef(language)
   languageRef.current = language
   const [snapshot, setSnapshot] = useState(emptySnapshot)
@@ -107,6 +130,7 @@ export default function App() {
   const [filter, setFilter] = useState<'all' | 'windows' | 'wsl' | 'issues'>('all')
   const [page, setPage] = useState<'services' | 'add'>('services')
   const [view, setView] = useState<'services' | 'mappings'>('services')
+  const [openPreference, setOpenPreference] = useState<'theme' | 'language' | null>(null)
   const [forwardingService, setForwardingService] = useState<ServiceView | null>(null)
   const [mappingModal, setMappingModal] = useState(false)
   const [toast, setToast] = useState<{ kind: 'success' | 'warning' | 'error'; message: string } | null>(null)
@@ -131,9 +155,27 @@ export default function App() {
   }, [refresh])
 
   useEffect(() => {
-    localStorage.setItem('portman.language', language)
+    const media = window.matchMedia('(prefers-color-scheme: dark)')
+    const updateTheme = () => setSystemTheme(media.matches ? 'dark' : 'light')
+    const updateLanguage = () => setSystemLanguageValue(systemLanguage())
+    media.addEventListener('change', updateTheme)
+    window.addEventListener('languagechange', updateLanguage)
+    return () => {
+      media.removeEventListener('change', updateTheme)
+      window.removeEventListener('languagechange', updateLanguage)
+    }
+  }, [])
+
+  useEffect(() => {
+    localStorage.setItem('portman.language', languagePreference)
     document.documentElement.lang = language === 'zh' ? 'zh-CN' : 'en'
-  }, [language])
+  }, [language, languagePreference])
+
+  useEffect(() => {
+    localStorage.setItem('portman.theme', themePreference)
+    document.documentElement.dataset.theme = theme
+    document.documentElement.style.colorScheme = theme
+  }, [theme, themePreference])
 
   useEffect(() => {
     if (!toast) return
@@ -239,17 +281,24 @@ export default function App() {
       </aside>
 
       <main className={`main ${page === 'add' ? 'add-main' : ''}`}>
-        {page === 'add' ? <AddServicePage language={language} onLanguageChange={setLanguage} busy={busy} onBack={() => setPage('services')} onOpenCandidate={(token) => void openDirectory(() => api.openCandidateProcessDirectory(token))} onCreate={async (candidates, name) => {
+        {page === 'add' ? <AddServicePage language={language} languagePreference={languagePreference} onLanguageChange={setLanguagePreference} busy={busy} onBack={() => setPage('services')} onOpenCandidate={(token) => void openDirectory(() => api.openCandidateProcessDirectory(token))} onCreate={async (candidates, name) => {
           const ok = await perform(() => api.createService(candidates.map((candidate) => candidate.candidateToken), name))
           if (ok) setPage('services')
           return ok
         }} /> : <>
         <header className="topbar">
-          <div className="view-switch">
-            <button className={view === 'services' ? 'active' : ''} onClick={() => { setView('services'); setQuery('') }}><Server size={17} />{l(language, 'Service Ports', '服务端口')}</button>
-            <button className={view === 'mappings' ? 'active' : ''} onClick={() => { setView('mappings'); setQuery('') }}><Network size={17} />{l(language, 'Port Mappings', '端口映射')}</button>
+          <div className="topbar-row topbar-primary">
+            <div className="view-switch">
+              <button className={view === 'services' ? 'active' : ''} onClick={() => { setView('services'); setQuery('') }}><Server size={17} />{l(language, 'Service Ports', '服务端口')}</button>
+              <button className={view === 'mappings' ? 'active' : ''} onClick={() => { setView('mappings'); setQuery('') }}><Network size={17} />{l(language, 'Port Mappings', '端口映射')}</button>
+            </div>
+            <div className="header-preferences">
+              <ThemeSwitch language={language} preference={themePreference} open={openPreference === 'theme'} onToggle={(open) => setOpenPreference(open ? 'theme' : null)} onChange={setThemePreference} />
+              <LanguageSwitch language={language} preference={languagePreference} open={openPreference === 'language'} onToggle={(open) => setOpenPreference(open ? 'language' : null)} onChange={setLanguagePreference} />
+            </div>
           </div>
-          <section className={`stats-grid header-stats ${view === 'mappings' ? 'mapping-stats' : ''}`}>
+          <div className="topbar-row topbar-secondary">
+            <section className={`stats-grid header-stats ${view === 'mappings' ? 'mapping-stats' : ''}`}>
             {view === 'services' ? <>
               <StatCard icon={<Box size={16} />} label={l(language, 'Tracked', '关注')} value={snapshot.services.length} tone="blue" />
               <StatCard icon={<Activity size={16} />} label={l(language, 'Running', '运行')} value={running} tone="green" />
@@ -261,15 +310,23 @@ export default function App() {
               <StatCard icon={<Activity size={16} />} label={l(language, 'Effective', '生效')} value={effectiveMappings} tone="green" />
               <StatCard icon={<AlertTriangle size={16} />} label={l(language, 'Source errors', '源异常')} value={mappingErrors} tone="red" />
             </>}
-          </section>
-          <div className="header-actions">
+            </section>
+            <div className="search header-search"><Search size={16} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={view === 'services' ? l(language, 'Search services, ports, processes, or paths…', '搜索服务、端口、进程或路径…') : l(language, 'Search mapping ports, addresses, or types…', '搜索映射端口、地址或类型…')} /></div>
+            {view === 'services' && <div className="filters header-filters">
+              {(['all', 'windows', 'wsl', 'issues'] as const).map((value) => (
+                <button key={value} className={filter === value ? 'active' : ''} onClick={() => setFilter(value)}>
+                  {{ all: l(language, 'All', '全部'), windows: 'Windows', wsl: 'WSL', issues: l(language, 'Issues', '异常') }[value]}
+                </button>
+              ))}
+            </div>}
+            <div className="header-actions">
             <button className="button ghost" onClick={() => void refresh()} disabled={loading || busy}>
               <RefreshCw size={16} className={loading ? 'spin' : ''} />{l(language, 'Refresh', '刷新')}
             </button>
             {view === 'services'
               ? <button className="button primary" onClick={() => setPage('add')}><Plus size={17} />{l(language, 'Add service', '添加服务')}</button>
               : <button className="button primary" onClick={() => setMappingModal(true)}><Plus size={17} />{l(language, 'Add mapping', '添加端口映射')}</button>}
-            <LanguageSwitch language={language} onChange={setLanguage} />
+            </div>
           </div>
         </header>
 
@@ -286,17 +343,6 @@ export default function App() {
         )}
 
         {view === 'services' ? <section className="service-panel">
-          <div className="panel-toolbar">
-            <div className="search"><Search size={16} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={l(language, 'Search services, ports, processes, or paths…', '搜索服务、端口、进程或路径…')} /></div>
-            <div className="filters">
-              {(['all', 'windows', 'wsl', 'issues'] as const).map((value) => (
-                <button key={value} className={filter === value ? 'active' : ''} onClick={() => setFilter(value)}>
-                  {{ all: l(language, 'All', '全部'), windows: 'Windows', wsl: 'WSL', issues: l(language, 'Issues', '异常') }[value]}
-                </button>
-              ))}
-            </div>
-          </div>
-
           <div className="service-table">
             <div className="table-head table-row">
               <span>{l(language, 'Service', '服务')}</span><span>{l(language, 'Status', '状态')}</span><span>{l(language, 'Bindings', '服务端点')}</span><span>{l(language, 'External', '外部端点')}</span><span>{l(language, 'Forwarding', '转发')}</span><span>{l(language, 'Actions', '操作')}</span>
@@ -327,8 +373,6 @@ export default function App() {
           language={language}
           loading={loading}
           busy={busy}
-          query={query}
-          onQueryChange={setQuery}
           groups={filteredMappingGroups}
           services={snapshot.services}
           totalMappings={snapshot.portMappings.length}
@@ -361,12 +405,10 @@ export default function App() {
   )
 }
 
-function PortMappingsPanel({ language, loading, busy, query, onQueryChange, groups, services, totalMappings, onAdd, onToggle, onDelete }: {
+function PortMappingsPanel({ language, loading, busy, groups, services, totalMappings, onAdd, onToggle, onDelete }: {
   language: Language
   loading: boolean
   busy: boolean
-  query: string
-  onQueryChange: (value: string) => void
   groups: Array<{ port: number; mappings: PortMapping[] }>
   services: ServiceView[]
   totalMappings: number
@@ -375,9 +417,6 @@ function PortMappingsPanel({ language, loading, busy, query, onQueryChange, grou
   onDelete: (mapping: PortMapping) => void
 }) {
   return <section className="service-panel mapping-panel">
-    <div className="panel-toolbar">
-      <div className="search"><Search size={16} /><input value={query} onChange={(event) => onQueryChange(event.target.value)} placeholder={l(language, 'Search mapping ports, addresses, or types…', '搜索映射端口、地址或类型…')} /></div>
-    </div>
     <div className="service-table mapping-table">
       <div className="table-head table-row mapping-table-row">
         <span>{l(language, 'Port', '映射端口')}</span>
@@ -432,8 +471,34 @@ function StatCard({ icon, label, value, tone }: { icon: React.ReactNode; label: 
   return <div className="stat-card"><div className={`stat-icon ${tone}`}>{icon}</div><div><span>{label}</span><strong>{value}</strong></div></div>
 }
 
-function LanguageSwitch({ language, onChange }: { language: Language; onChange: (language: Language) => void }) {
-  return <div className="language-switch"><button className={language === 'en' ? 'active' : ''} onClick={() => onChange('en')}>EN</button><button className={language === 'zh' ? 'active' : ''} onClick={() => onChange('zh')}>中文</button></div>
+function ThemeSwitch({ language, preference, open, onToggle, onChange }: { language: Language; preference: ThemePreference; open: boolean; onToggle: (open: boolean) => void; onChange: (preference: ThemePreference) => void }) {
+  const options: Array<{ value: ThemePreference; icon: React.ReactNode; label: string }> = [
+    { value: 'system', icon: <Monitor size={15} />, label: l(language, 'System', '系统') },
+    { value: 'light', icon: <Sun size={15} />, label: l(language, 'Light', '浅色') },
+    { value: 'dark', icon: <Moon size={15} />, label: l(language, 'Dark', '深色') },
+  ]
+  const current = options.find((option) => option.value === preference) ?? options[0]
+  return <div className="preference-menu">
+    <button className="preference-trigger" aria-label={l(language, 'Color theme', '颜色主题')} aria-expanded={open} onClick={() => onToggle(!open)}><Palette className="preference-category-icon" size={15} />{current.icon}<ChevronDown size={13} /></button>
+    {open && <div className="preference-options">
+      {options.map((option) => <button className={option.value === preference ? 'active' : ''} key={option.value} onClick={() => { onChange(option.value); onToggle(false) }}>{option.icon}<span>{option.label}</span></button>)}
+    </div>}
+  </div>
+}
+
+function LanguageSwitch({ language, preference, open, onToggle, onChange }: { language: Language; preference: LanguagePreference; open: boolean; onToggle: (open: boolean) => void; onChange: (language: LanguagePreference) => void }) {
+  const options: Array<{ value: LanguagePreference; icon: React.ReactNode; label: string }> = [
+    { value: 'system', icon: <Monitor size={15} />, label: l(language, 'System', '系统') },
+    { value: 'en', icon: <span className="language-choice-mark">EN</span>, label: 'English' },
+    { value: 'zh', icon: <span className="language-choice-mark">中</span>, label: '中文' },
+  ]
+  const current = options.find((option) => option.value === preference) ?? options[0]
+  return <div className="preference-menu">
+    <button className="preference-trigger" aria-label={l(language, 'Language', '语言')} aria-expanded={open} onClick={() => onToggle(!open)}><Languages className="preference-category-icon" size={15} />{current.icon}<ChevronDown size={13} /></button>
+    {open && <div className="preference-options">
+      {options.map((option) => <button className={option.value === preference ? 'active' : ''} key={option.value} onClick={() => { onChange(option.value); onToggle(false) }}>{option.icon}<span>{option.label}</span></button>)}
+    </div>}
+  </div>
 }
 
 function ServiceRow({ service, language, busy, onCreateForwarding, onOpenProcessDirectory, onToggle, onDeleteForwarding, onRemove }: {
@@ -599,9 +664,10 @@ function parsePortExpression(value: string): number[] | null {
   return ports
 }
 
-function AddServicePage({ language, onLanguageChange, busy, onBack, onOpenCandidate, onCreate }: { language: Language; onLanguageChange: (language: Language) => void; busy: boolean; onBack: () => void; onOpenCandidate: (token: string) => void; onCreate: (candidates: Candidate[], name: string) => Promise<boolean> }) {
+function AddServicePage({ language, languagePreference, onLanguageChange, busy, onBack, onOpenCandidate, onCreate }: { language: Language; languagePreference: LanguagePreference; onLanguageChange: (language: LanguagePreference) => void; busy: boolean; onBack: () => void; onOpenCandidate: (token: string) => void; onCreate: (candidates: Candidate[], name: string) => Promise<boolean> }) {
   const languageRef = useRef(language)
   languageRef.current = language
+  const [languageMenuOpen, setLanguageMenuOpen] = useState(false)
   const [result, setResult] = useState<DiscoveryResult | null>(null)
   const [error, setError] = useState('')
   const [query, setQuery] = useState('')
@@ -661,7 +727,7 @@ function AddServicePage({ language, onLanguageChange, busy, onBack, onOpenCandid
           <button className={showUdp ? 'active' : ''} onClick={() => setShowUdp(!showUdp)}>UDP</button>
           <button className={showWindowsSystemServices ? 'active' : ''} onClick={() => setShowWindowsSystemServices(!showWindowsSystemServices)}>{l(language, 'System services', '系统服务')}</button>
         </div>
-        <LanguageSwitch language={language} onChange={onLanguageChange} />
+        <LanguageSwitch language={language} preference={languagePreference} open={languageMenuOpen} onToggle={setLanguageMenuOpen} onChange={onLanguageChange} />
       </div>
     </header>
     <section className="service-panel add-panel"><div className="add-panel-body">
